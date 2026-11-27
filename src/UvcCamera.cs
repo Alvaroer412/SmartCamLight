@@ -150,6 +150,7 @@ namespace SmartCamLight
 
         public bool Set(CamProp p, int value, bool auto)
         {
+            if (Program.Preview) return true;   // read-only mode: leave the camera as it is
             int flags = auto ? 1 : 2;
             if (p.Group == "VPA" && vpa != null) return vpa.Set(p.Id, value, flags) == 0;
             if (p.Group == "CC" && cc != null) return cc.Set(p.Id, value, flags) == 0;
