@@ -15,6 +15,7 @@ namespace SmartCamLight
 
         public bool Write(byte[] cmd)
         {
+            if (Program.Preview) return true;   // read-only mode: never send anything to the light
             byte[] buf = new byte[Math.Max(20, OutputLength)];
             Array.Copy(cmd, buf, cmd.Length);
             int written;
@@ -202,12 +203,18 @@ namespace SmartCamLight
                 NumberFeatureButtonCaps, NumberFeatureValueCaps, NumberFeatureDataIndices;
         }
 
+        // The HidD_* functions return a one-byte BOOLEAN. Marshal it as such: only the low byte of
+        // the return register is defined, which matters on ARM64.
         [DllImport("hid.dll")] public static extern void HidD_GetHidGuid(out Guid guid);
-        [DllImport("hid.dll", SetLastError = true)] public static extern bool HidD_GetAttributes(SafeFileHandle h, ref HIDD_ATTRIBUTES a);
-        [DllImport("hid.dll", SetLastError = true)] public static extern bool HidD_GetPreparsedData(SafeFileHandle h, out IntPtr data);
-        [DllImport("hid.dll")] public static extern bool HidD_FreePreparsedData(IntPtr data);
+        [DllImport("hid.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.U1)]
+        public static extern bool HidD_GetAttributes(SafeFileHandle h, ref HIDD_ATTRIBUTES a);
+        [DllImport("hid.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.U1)]
+        public static extern bool HidD_GetPreparsedData(SafeFileHandle h, out IntPtr data);
+        [DllImport("hid.dll")] [return: MarshalAs(UnmanagedType.U1)]
+        public static extern bool HidD_FreePreparsedData(IntPtr data);
         [DllImport("hid.dll")] public static extern int HidP_GetCaps(IntPtr data, out HIDP_CAPS caps);
-        [DllImport("hid.dll", SetLastError = true)] public static extern bool HidD_SetOutputReport(SafeFileHandle h, byte[] buf, int len);
+        [DllImport("hid.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.U1)]
+        public static extern bool HidD_SetOutputReport(SafeFileHandle h, byte[] buf, int len);
 
         [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern IntPtr SetupDiGetClassDevs(ref Guid g, IntPtr enumerator, IntPtr hwnd, int flags);

@@ -23,7 +23,7 @@ namespace SmartCamLight
         public static Settings Load()
         {
             var s = new Settings();
-            MigrateFromOldName();
+            if (!Program.Preview) MigrateFromOldName();
             if (!File.Exists(FilePath)) { s.FirstRun = true; return s; }
             try
             {
@@ -77,6 +77,7 @@ namespace SmartCamLight
 
         public void Save()
         {
+            if (Program.Preview) { FirstRun = false; return; }   // read-only mode: keep the real settings untouched
             try
             {
                 Directory.CreateDirectory(Dir);
@@ -114,8 +115,12 @@ namespace SmartCamLight
         {
             try
             {
-                Directory.CreateDirectory(Settings.Dir);
-                string path = Path.Combine(Settings.Dir, "smartcamlight.log");
+                string path = Path.Combine(Path.GetTempPath(), "SmartCamLight-preview.log");
+                if (!Program.Preview)
+                {
+                    Directory.CreateDirectory(Settings.Dir);
+                    path = Path.Combine(Settings.Dir, "smartcamlight.log");
+                }
                 if (File.Exists(path) && new FileInfo(path).Length > 512 * 1024) File.Delete(path);
                 File.AppendAllText(path, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + msg + Environment.NewLine);
             }

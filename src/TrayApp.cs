@@ -16,13 +16,16 @@ namespace SmartCamLight
         readonly LitraManager litra = new LitraManager();
         readonly NotifyIcon tray;
         readonly ContextMenuStrip menu;
-        readonly ToolStripMenuItem miStatus, miPower, miSmart;
-        readonly System.Windows.Forms.Timer pollTimer, refreshTimer, debounceTimer, camApplyTimer, saveTimer;
+        readonly ToolStripMenuItem miStatus, miPower, miSmart, miPresets, miPreview;
+        readonly MenuSlider msBright, msTemp;
+        readonly System.Windows.Forms.Timer pollTimer, refreshTimer, debounceTimer, camApplyTimer, saveTimer, themeTimer;
         readonly DeviceChangeWindow devWin;
         readonly Control invoker;
         SettingsForm form;
         Icon currentIcon;
         string lastIconKey = "", lastCamList = "";
+        bool previewStartup, previewActive;
+        readonly string ownProcess = System.Diagnostics.Process.GetCurrentProcess().ProcessName;
 
         bool lightOn, cameraInUse;
         DateTime offPendingSince = DateTime.MinValue;
@@ -44,31 +47,41 @@ namespace SmartCamLight
             miStatus = new ToolStripMenuItem("") { Enabled = false };
             miPower = new ToolStripMenuItem("Light on", null, delegate { SetLightManual(!lightOn); });
             miSmart = new ToolStripMenuItem("Smart activation", null, delegate { SetSmart(!S.SmartActivation); });
-            var miBright = new ToolStripMenuItem("Brightness");
-            foreach (int pct in new[] { 10, 25, 50, 75, 100 })
+            // Live sliders, as in the Windows 11 quick settings: the light follows while you drag.
+            msBright = new MenuSlider("Brightness", 0, 100, 1) { Format = v => v + "%" };
+            msBright.ValueChanged += delegate { SetBrightness(msBright.Value); if (form != null) form.ReloadLight(); };
+            msTemp = new MenuSlider("Colour temperature", 2700, 6500, 100) { Format = v => v + " K" };
+            msTemp.Gradient = new[] { Ui.Tint(2700), Ui.Tint(3650), Ui.Tint(4600), Ui.Tint(5550), Ui.Tint(6500) };
+            msTemp.ValueChanged += delegate { SetTemperature(msTemp.Value); if (form != null) form.ReloadLight(); };
+            miPresets = new ToolStripMenuItem("Presets");
+            for (int i = 0; i < SettingsForm.PresetK.Length; i++)
             {
-                int p = pct;
-                miBright.DropDownItems.Add(new ToolStripMenuItem(p + "%", null, delegate { SetBrightness(p); if (form != null) form.ReloadLight(); }));
+                int k = SettingsForm.PresetK[i];
+                miPresets.DropDownItems.Add(new ToolStripMenuItem(SettingsForm.PresetNames[i], null, delegate
+                {
+                    SetTemperature(k);
+                    msTemp.Value = k;
+                    if (form != null) form.ReloadLight();
+                }) { ShortcutKeyDisplayString = k + " K" });
             }
-            var miTemp = new ToolStripMenuItem("Colour temperature");
-            foreach (int k in new[] { 2700, 3500, 4500, 5500, 6500 })
-            {
-                int kk = k;
-                miTemp.DropDownItems.Add(new ToolStripMenuItem(kk + " K", null, delegate { SetTemperature(kk); if (form != null) form.ReloadLight(); }));
-            }
+            miPreview = new ToolStripMenuItem("Camera preview", null, delegate { TogglePreview(); });
+
             menu.Items.Add(miStatus);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(miPower);
             menu.Items.Add(miSmart);
-            menu.Items.Add(miBright);
-            menu.Items.Add(miTemp);
             menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(new MenuSliderItem(msBright));
+            menu.Items.Add(new MenuSliderItem(msTemp));
+            menu.Items.Add(miPresets);
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(miPreview);
             menu.Items.Add(new ToolStripMenuItem("Settings…", null, delegate { ShowSettings(); }));
             menu.Items.Add(new ToolStripMenuItem("Exit", null, delegate { Exit(); }));
-            menu.Opening += delegate { UpdateUi(); };
-            MenuRenderer.Apply(menu);
-            foreach (ToolStripItem item in menu.Items) MenuRenderer.Style(item);
-            miStatus.ForeColor = Ui.Text2;
+            // Styled on every opening: the taskbar's monitor can have a different scale than the
+            // settings window's, and the theme may have changed.
+            menu.Opening += delegate { MenuRenderer.Apply(menu, Ui.ScaleAt(Cursor.Position)); UpdateUi(); };
+            MenuRenderer.Apply(menu, Ui.S);
 
             saveTimer = new System.Windows.Forms.Timer { Interval = 500 };
             saveTimer.Tick += delegate { saveTimer.Stop(); S.Save(); };
@@ -104,6 +117,10 @@ namespace SmartCamLight
             devWin = new DeviceChangeWindow(delegate { debounceTimer.Stop(); debounceTimer.Start(); });
             SystemEvents.PowerModeChanged += OnPowerModeChanged;
 
+            themeTimer = new System.Windows.Forms.Timer { Interval = 400 };
+            themeTimer.Tick += delegate { themeTimer.Stop(); ApplyThemeChange(); };
+            SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
+
             var t = new Thread(delegate ()
             {
                 while (true)
@@ -115,7 +132,7 @@ namespace SmartCamLight
             t.Start();
 
             UpdateUi();
-            if (S.FirstRun)
+            if (S.FirstRun && !Program.Preview)
             {
                 S.Save();
                 tray.ShowBalloonTip(4000, "SmartCamLight is running", "It lives in the system tray. Click the icon for settings.", ToolTipIcon.Info);
@@ -129,8 +146,10 @@ namespace SmartCamLight
         {
             var ignore = S.IgnoreSet();
             ignore.Add("SmartCamLight");
+            ignore.Add(ownProcess);   // whatever this build's exe is called
             var list = CameraUsage.GetActiveApps();
             list.RemoveAll(a => ignore.Contains(a));
+            if (previewActive) list.Add("SmartCamLight preview");
             list.Sort(StringComparer.OrdinalIgnoreCase);
             return list;
         }
@@ -164,6 +183,15 @@ namespace SmartCamLight
                 }
             }
             if (changed) UpdateUi();
+        }
+
+        // The settings window started or stopped its live camera preview. The preview counts as
+        // camera use, so with smart activation the light behaves the way it will in a call.
+        public void SetPreviewActive(bool on)
+        {
+            if (previewActive == on) return;
+            previewActive = on;
+            Poll();
         }
 
         // ---------- Light ----------
@@ -276,17 +304,34 @@ namespace SmartCamLight
             });
         }
 
+        // ---------- Theme ----------
+
+        // Windows switched between dark and light mode, or the accent colour changed.
+        void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+        {
+            try { invoker.BeginInvoke((MethodInvoker)delegate { themeTimer.Stop(); themeTimer.Start(); }); } catch { }
+        }
+
+        void ApplyThemeChange()
+        {
+            if (!Ui.LoadTheme()) return;
+            if (form != null && !form.IsDisposed) form.Rebuild();
+            UpdateUi();
+        }
+
         // ---------- Startup ----------
 
         public bool StartWithWindows
         {
             get
             {
+                if (Program.Preview) return previewStartup;
                 using (var k = Registry.CurrentUser.OpenSubKey(RunKey))
                     return k != null && k.GetValue(RunValue) != null;
             }
             set
             {
+                if (Program.Preview) { previewStartup = value; return; }
                 using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
                 {
                     if (value) k.SetValue(RunValue, "\"" + Application.ExecutablePath + "\" --tray");
@@ -312,6 +357,11 @@ namespace SmartCamLight
             miPower.Checked = lightOn;
             miPower.Enabled = LightConnected;
             miSmart.Checked = S.SmartActivation;
+            msBright.Value = S.BrightnessPct;
+            msTemp.Value = S.TemperatureK;
+            foreach (ToolStripMenuItem p in miPresets.DropDownItems)
+                p.Checked = p.ShortcutKeyDisplayString == S.TemperatureK + " K";
+            miPreview.Checked = form != null && !form.IsDisposed && form.PreviewOn;
 
             string tip = "SmartCamLight – " + StatusText();
             tray.Text = tip.Length > 63 ? tip.Substring(0, 60) + "…" : tip;
@@ -340,12 +390,22 @@ namespace SmartCamLight
             form.Activate();
         }
 
+        // Opens the settings window with the camera preview running, or stops a running preview.
+        void TogglePreview()
+        {
+            if (form != null && !form.IsDisposed && form.PreviewOn) { form.SetPreviewFromTray(false); return; }
+            ShowSettings();
+            form.SetPreviewFromTray(true);
+        }
+
         void Exit()
         {
             pollTimer.Stop(); refreshTimer.Stop();
             saveTimer.Stop(); S.Save();
             SensorMonitor.Stop();
             SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+            SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
+            themeTimer.Stop();
             if (form != null) form.Close();
             tray.Visible = false;
             tray.Dispose();

@@ -8,32 +8,131 @@ namespace SmartCamLight
 {
     interface IAutoHeight { int MeasureHeight(int width); }
 
+    // Eases a value towards a target on the UI thread and repaints its owner while it moves.
+    class Tween
+    {
+        readonly Timer timer = new Timer { Interval = 15 };
+        readonly Control owner;
+        public float Value, Target;
+
+        public Tween(Control owner, float rate)
+        {
+            this.owner = owner;
+            timer.Tick += delegate
+            {
+                Value += (Target - Value) * rate;
+                if (Math.Abs(Target - Value) < 0.01f) { Value = Target; timer.Stop(); }
+                this.owner.Invalidate();
+            };
+        }
+
+        public void To(float target)
+        {
+            Target = target;
+            if (Value != Target) timer.Start();
+        }
+
+        public void Jump(float value)
+        {
+            Value = Target = value;
+            timer.Stop();
+            owner.Invalidate();
+        }
+
+        public void Dispose() { timer.Dispose(); }
+    }
+
+    // Container that shows the bare window backdrop (Mica, or the solid fallback colour).
+    class Backdrop : Control
+    {
+        public Backdrop()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.Opaque, true);
+            SetStyle(ControlStyles.Selectable, false);
+            TabStop = false;
+        }
+
+        protected override void OnPaint(PaintEventArgs e) { Ui.Erase(e); }
+    }
+
+    // Base for everything that draws itself. Subclasses draw in Draw(); the result keeps its alpha
+    // channel all the way to the screen, so anything left unpainted shows the backdrop.
     abstract class UiControl : Control
     {
         protected bool hover, pressed;
+        bool onCard;
+        List<Tween> tweens;
 
         protected UiControl()
         {
-            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
-                     ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor, true);
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.Opaque | ControlStyles.ResizeRedraw, true);
+            SetStyle(ControlStyles.Selectable, false);
+            TabStop = false;
+        }
+
+        // True when the control sits on a card: it then paints the card's translucent fill under itself.
+        public bool OnCard
+        {
+            get { return onCard; }
+            set
+            {
+                onCard = value;
+                foreach (Control c in Controls)
+                {
+                    var u = c as UiControl;
+                    if (u != null) u.OnCard = value;
+                }
+                Invalidate();
+            }
+        }
+
+        protected void MakeFocusable()
+        {
+            SetStyle(ControlStyles.Selectable, true);
+            TabStop = true;
+        }
+
+        protected bool ShowFocus { get { return Focused && Ui.KeyFocus; } }
+
+        protected Tween NewTween(float rate)
+        {
+            if (tweens == null) tweens = new List<Tween>();
+            var t = new Tween(this, rate);
+            tweens.Add(t);
+            return t;
+        }
+
+        protected override void OnControlAdded(ControlEventArgs e)
+        {
+            var u = e.Control as UiControl;
+            if (u != null) u.OnCard = onCard;
+            base.OnControlAdded(e);
         }
 
         protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
         protected override void OnMouseLeave(EventArgs e) { hover = false; pressed = false; Invalidate(); base.OnMouseLeave(e); }
-        protected override void OnMouseDown(MouseEventArgs e) { if (e.Button == MouseButtons.Left) { pressed = true; Invalidate(); } base.OnMouseDown(e); }
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                pressed = true; Invalidate();
+                if (GetStyle(ControlStyles.Selectable) && CanFocus) Focus();
+            }
+            base.OnMouseDown(e);
+        }
         protected override void OnMouseUp(MouseEventArgs e) { pressed = false; Invalidate(); base.OnMouseUp(e); }
         protected override void OnEnabledChanged(EventArgs e) { Invalidate(); base.OnEnabledChanged(e); }
+        protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+        protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
 
-        protected override void OnPaintBackground(PaintEventArgs e)
-        {
-            using (var b = new SolidBrush(BackColor)) e.Graphics.FillRectangle(b, ClientRectangle);
-        }
+        protected override void OnPaint(PaintEventArgs e) { Ui.Paint(this, e, onCard, Draw); }
 
-        protected static Graphics Smooth(PaintEventArgs e)
+        protected abstract void Draw(Graphics g);
+
+        protected override void Dispose(bool disposing)
         {
-            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            return e.Graphics;
+            if (disposing && tweens != null) foreach (var t in tweens) t.Dispose();
+            base.Dispose(disposing);
         }
     }
 
@@ -41,32 +140,36 @@ namespace SmartCamLight
     class Toggle : UiControl
     {
         bool on;
-        float pos;
-        readonly Timer anim = new Timer { Interval = 15 };
+        readonly bool showState;
+        readonly Tween pos, grow;
         public event EventHandler Toggled;
 
-        public Toggle()
+        public Toggle() : this(false) { }
+
+        // showState adds the "On" / "Off" label beside the switch, as in Windows Settings.
+        public Toggle(bool showState)
         {
-            Size = new Size(Ui.Px(40), Ui.Px(20));
+            this.showState = showState;
+            pos = NewTween(0.35f);
+            grow = NewTween(0.4f);
+            int label = 0;
+            if (showState)
+                label = Math.Max(Ui.Measure("On", Ui.Body, 0, false).Width, Ui.Measure("Off", Ui.Body, 0, false).Width) + Ui.Px(12);
+            Size = new Size(label + Ui.Px(48), Ui.Px(28));
             Cursor = Cursors.Hand;
-            SetStyle(ControlStyles.Selectable, true);
-            TabStop = true;
-            anim.Tick += delegate
-            {
-                float target = on ? 1 : 0;
-                pos += (target - pos) * 0.35f;
-                if (Math.Abs(target - pos) < 0.02f) { pos = target; anim.Stop(); }
-                Invalidate();
-            };
+            MakeFocusable();
         }
+
+        // Gap between the switch and the control's edge; it leaves room for the focus ring.
+        public static int Inset { get { return Ui.Px(4); } }
 
         public bool Checked
         {
             get { return on; }
-            set { if (on == value) return; on = value; anim.Start(); }
+            set { if (on == value) return; on = value; pos.To(on ? 1 : 0); Invalidate(); }
         }
 
-        public void SetInstant(bool value) { on = value; pos = value ? 1 : 0; anim.Stop(); Invalidate(); }
+        public void SetInstant(bool value) { on = value; pos.Jump(value ? 1 : 0); }
 
         void Flip()
         {
@@ -76,32 +179,42 @@ namespace SmartCamLight
         }
 
         protected override void OnClick(EventArgs e) { Flip(); base.OnClick(e); }
-        protected override void OnKeyDown(KeyEventArgs e) { if (e.KeyCode == Keys.Space) Flip(); base.OnKeyDown(e); }
+        protected override void OnKeyDown(KeyEventArgs e) { if (e.KeyCode == Keys.Space || e.KeyCode == Keys.Enter) Flip(); base.OnKeyDown(e); }
+        protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); grow.To(1); }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); grow.To(0); }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void Draw(Graphics g)
         {
-            var g = Smooth(e);
-            var r = new RectangleF(1, 1, Width - 2.5f, Height - 2.5f);
-            float rad = r.Height / 2;
+            float w = Ui.Px(40), h = Ui.Px(20);
+            var r = new RectangleF(Width - Inset - w, (Height - h) / 2f, w, h);
+            float rad = h / 2;
             Color knob;
             if (on)
             {
-                Ui.FillRound(g, !Enabled ? Ui.Text3 : (hover ? Ui.AccentHover : Ui.Accent), r, rad);
-                knob = Ui.OnAccent;
+                Ui.FillRound(g, !Enabled ? Ui.AccentDisabled : pressed ? Ui.AccentPressed : hover ? Ui.AccentHover : Ui.Accent, r, rad);
+                knob = Enabled ? Ui.OnAccent : Ui.OnAccentDisabled;
             }
             else
             {
-                Ui.FillRound(g, hover && Enabled ? Ui.Hover : BackColor, r, rad);
-                Ui.DrawRound(g, Enabled ? Ui.Text2 : Ui.Text3, r, rad, Math.Max(1f, Ui.S));
-                knob = Enabled ? Ui.Text2 : Ui.Text3;
+                float t = Ui.Hair;
+                var o = new RectangleF(r.X + t / 2, r.Y + t / 2, r.Width - t, r.Height - t);
+                Ui.FillRound(g, hover && Enabled ? Ui.SwitchOffHover : Ui.SwitchOff, o, rad);
+                Ui.DrawRound(g, Enabled ? Ui.Strong : Ui.StrongDisabled, o, rad, t);
+                knob = Enabled ? Ui.Text2 : Ui.TextDisabled;
             }
-            float kr = r.Height * (hover && Enabled ? 0.31f : 0.26f);
-            float cx = r.X + rad + (r.Width - 2 * rad) * pos;
-            float cy = r.Y + r.Height / 2;
-            using (var b = new SolidBrush(knob)) g.FillEllipse(b, cx - kr, cy - kr, kr * 2, kr * 2);
-        }
 
-        protected override void Dispose(bool disposing) { if (disposing) anim.Dispose(); base.Dispose(disposing); }
+            // The knob grows a little on hover and stretches while pressed.
+            float kh = Ui.Px(12) + (Enabled ? grow.Value : 0) * Ui.Px(2);
+            float stretch = pressed && Enabled ? Ui.Px(3) : 0;
+            float cx = r.X + h / 2 + (w - h) * pos.Value;
+            float left = cx - kh / 2 - stretch * pos.Value;
+            Ui.FillRound(g, knob, new RectangleF(left, r.Y + (h - kh) / 2, kh + stretch, kh), kh / 2);
+
+            if (showState)
+                Ui.DrawText(g, on ? "On" : "Off", Ui.Body, Enabled ? Ui.Text : Ui.TextDisabled,
+                    new Rectangle(0, 0, (int)r.X - Ui.Px(12), Height), TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
+            if (ShowFocus) Ui.FocusRing(g, RectangleF.Inflate(r, Ui.Px(3), Ui.Px(3)), rad + Ui.Px(3));
+        }
     }
 
     // ---------------- Slider ----------------
@@ -109,15 +222,16 @@ namespace SmartCamLight
     {
         int min, max = 100, val, step = 1;
         bool drag;
+        readonly Tween dot;   // inner dot size: -1 pressed, 0 rest, 1 hover
         public Color[] Gradient;
         public event EventHandler ValueChanged;   // user changes only
 
         public ModernSlider()
         {
-            Height = Ui.Px(28);
+            Height = Ui.Px(32);
             Cursor = Cursors.Hand;
-            SetStyle(ControlStyles.Selectable, true);
-            TabStop = true;
+            dot = NewTween(0.4f);
+            MakeFocusable();
         }
 
         public void SetRange(int minimum, int maximum, int stepSize)
@@ -130,11 +244,15 @@ namespace SmartCamLight
         public int Minimum { get { return min; } }
         public int Maximum { get { return max; } }
 
+        // Distance from the control's edge to the end of the track (thumb radius plus focus ring).
+        public static int Inset { get { return Ui.Px(13); } }
+
         int Clamp(int v) { return Math.Max(min, Math.Min(max, v)); }
-        float Radius { get { return Ui.Px(10); } }
-        float L { get { return Radius + 1; } }
-        float R { get { return Width - Radius - 1; } }
+        float L { get { return Inset; } }
+        float R { get { return Width - Inset; } }
         float Frac { get { return (val - min) / (float)(max - min); } }
+
+        void Aim() { dot.To(!Enabled ? 0 : drag ? -1 : hover ? 1 : 0); }
 
         void SetValueUser(int v)
         {
@@ -150,14 +268,19 @@ namespace SmartCamLight
             SetValueUser(min + (int)Math.Round(f * (max - min)));
         }
 
+        protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); Aim(); }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); Aim(); }
+        protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); Aim(); }
+
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
             if (!Enabled || e.Button != MouseButtons.Left) return;
-            Focus(); drag = true; Capture = true; SetFromX(e.X);
+            drag = true; Capture = true; Aim(); SetFromX(e.X);
         }
+
         protected override void OnMouseMove(MouseEventArgs e) { base.OnMouseMove(e); if (drag) SetFromX(e.X); }
-        protected override void OnMouseUp(MouseEventArgs e) { base.OnMouseUp(e); drag = false; Capture = false; Invalidate(); }
+        protected override void OnMouseUp(MouseEventArgs e) { base.OnMouseUp(e); drag = false; Capture = false; Aim(); }
 
         protected override bool IsInputKey(Keys k)
         {
@@ -188,9 +311,8 @@ namespace SmartCamLight
             return Ui.Blend(Gradient[i], Gradient[i + 1], p - i);
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void Draw(Graphics g)
         {
-            var g = Smooth(e);
             float cy = Height / 2f;
             float x = L + Frac * (R - L);
 
@@ -203,26 +325,36 @@ namespace SmartCamLight
                     var blend = new ColorBlend(Gradient.Length);
                     for (int i = 0; i < Gradient.Length; i++)
                     {
-                        blend.Colors[i] = Enabled ? Gradient[i] : Ui.Blend(Gradient[i], Ui.Track, 0.7f);
+                        blend.Colors[i] = Enabled ? Gradient[i] : Color.FromArgb(70, Gradient[i]);
                         blend.Positions[i] = i / (float)(Gradient.Length - 1);
                     }
                     lb.InterpolationColors = blend;
                     using (var p = Ui.Round(tr, th / 2)) g.FillPath(lb, p);
                 }
+                Ui.DrawRound(g, Ui.Stroke, tr, th / 2, Ui.Hair);
             }
             else
             {
+                // Rail to the right of the thumb, accent fill to the left; the thumb hides the join.
                 float th = Ui.Px(4);
-                Ui.FillRound(g, Ui.Track, new RectangleF(L - th / 2, cy - th / 2, R - L + th, th), th / 2);
-                Ui.FillRound(g, Enabled ? Ui.Accent : Ui.Text3, new RectangleF(L - th / 2, cy - th / 2, x - L + th, th), th / 2);
+                Ui.FillRound(g, Enabled ? Ui.Rail : Ui.RailDisabled, new RectangleF(x, cy - th / 2, R - x + th / 2, th), th / 2);
+                Ui.FillRound(g, Enabled ? Ui.Accent : Ui.AccentDisabled, new RectangleF(L - th / 2, cy - th / 2, x - L + th / 2, th), th / 2);
             }
 
-            float rad = Radius;
+            float rad = Ui.Px(10);
             using (var b = new SolidBrush(Ui.ThumbOuter)) g.FillEllipse(b, x - rad, cy - rad, rad * 2, rad * 2);
-            using (var p = new Pen(Ui.Dark ? Ui.Hex("#505050") : Ui.Hex("#D6D6D6"), Math.Max(1f, Ui.S))) g.DrawEllipse(p, x - rad, cy - rad, rad * 2, rad * 2);
-            float ir = rad * (drag ? 0.45f : (hover ? 0.62f : 0.52f));
-            Color inner = !Enabled ? Ui.Text3 : (Gradient != null ? GradientAt(Frac) : Ui.Accent);
+            using (var p = new Pen(Ui.ThumbStroke, Ui.Hair)) g.DrawEllipse(p, x - rad, cy - rad, rad * 2, rad * 2);
+            float ir = (Ui.Px(12) + dot.Value * Ui.Px(2)) / 2f;
+            Color inner = !Enabled ? Ui.AccentDisabled : Gradient != null ? GradientAt(Frac) : Ui.Accent;
             using (var b = new SolidBrush(inner)) g.FillEllipse(b, x - ir, cy - ir, ir * 2, ir * 2);
+            if (Gradient != null && Enabled)
+                using (var p = new Pen(Ui.ThumbStroke, Ui.Hair)) g.DrawEllipse(p, x - ir, cy - ir, ir * 2, ir * 2);
+
+            if (ShowFocus)
+            {
+                float fr = rad + Ui.Px(3);
+                Ui.FocusRing(g, new RectangleF(x - fr, cy - fr, fr * 2, fr * 2), fr);
+            }
         }
     }
 
@@ -237,6 +369,7 @@ namespace SmartCamLight
         {
             Text = text; this.glyph = glyph; this.primary = primary;
             Cursor = Cursors.Hand;
+            MakeFocusable();
             Fit();
         }
 
@@ -244,39 +377,46 @@ namespace SmartCamLight
 
         public void Fit()
         {
-            int w = Ui.Measure(Text, Ui.Body, 0, false).Width + Ui.Px(28);
-            if (glyph != null) w += Ui.Px(24);
-            Size = new Size(w, Ui.Px(32));
+            int w = Ui.Measure(Text, Ui.Body, 0, false).Width + Ui.Px(24);
+            if (glyph != null) w += Ui.Px(22);
+            Size = new Size(Math.Max(w, Ui.Px(56)), Ui.Px(32));
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void OnKeyDown(KeyEventArgs e)
         {
-            var g = Smooth(e);
-            var r = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
-            Color fill, fg;
-            if (primary)
+            if (e.KeyCode == Keys.Space || e.KeyCode == Keys.Enter) OnClick(EventArgs.Empty);
+            base.OnKeyDown(e);
+        }
+
+        protected override void Draw(Graphics g)
+        {
+            float rad = Ui.Px(4);
+            Color fg;
+            if (primary || selected)
             {
-                fill = !Enabled ? Ui.Text3 : (pressed ? Ui.Accent : hover ? Ui.AccentHover : Ui.Accent);
-                fg = Ui.OnAccent;
+                // Accent button: also the "on" look of a toggle button.
+                Ui.FillRound(g, !Enabled ? Ui.AccentDisabled : pressed ? Ui.AccentPressed : hover ? Ui.AccentHover : Ui.Accent,
+                    new RectangleF(0, 0, Width, Height), rad);
+                fg = Enabled ? Ui.OnAccent : Ui.OnAccentDisabled;
             }
             else
             {
-                fill = pressed ? Ui.Pressed : hover ? Ui.Hover : Ui.Button;
-                fg = Enabled ? Ui.Text : Ui.Text3;
+                var r = Ui.Edge(Width, Height);
+                Ui.FillRound(g, !Enabled ? Ui.FillDisabled : pressed ? Ui.FillPressed : hover ? Ui.FillHover : Ui.Fill, r, rad);
+                Ui.Elevation(g, r, rad);
+                fg = !Enabled ? Ui.TextDisabled : pressed ? Ui.Text2 : Ui.Text;
             }
-            Ui.FillRound(g, fill, r, Ui.Px(5));
-            if (!primary) Ui.DrawRound(g, selected ? Ui.Accent : Ui.ButtonBorder, r, Ui.Px(5), selected ? Math.Max(1.5f, 1.5f * Ui.S) : 1f);
-            if (selected && !primary) fg = Ui.Accent;
 
             int tw = Ui.Measure(Text, Ui.Body, 0, false).Width;
-            int total = tw + (glyph != null ? Ui.Px(24) : 0);
+            int total = tw + (glyph != null ? Ui.Px(22) : 0);
             int x = (Width - total) / 2;
             if (glyph != null)
             {
-                Ui.Glyph(g, glyph, Ui.IconSmall, fg, new Rectangle(x, 0, Ui.Px(16), Height));
-                x += Ui.Px(24);
+                Ui.Glyph(g, glyph, Ui.IconSmall, fg, new Rectangle(x, 0, Ui.Px(14), Height));
+                x += Ui.Px(22);
             }
-            Ui.DrawText(g, Text, Ui.Body, fg, new Rectangle(x, 0, tw + 2, Height), TextFormatFlags.VerticalCenter);
+            Ui.DrawText(g, Text, Ui.Body, fg, new Rectangle(x, 0, tw + 2, Height - Ui.Px(1)), TextFormatFlags.VerticalCenter);
+            if (ShowFocus) Ui.FocusRing(g, new RectangleF(0, 0, Width, Height), rad);
         }
     }
 
@@ -284,9 +424,15 @@ namespace SmartCamLight
     {
         readonly List<object> items = new List<object>();
         int sel = -1;
+        public string Placeholder = "";
         public event EventHandler SelectionChanged;
 
-        public DropDown() { Size = new Size(Ui.Px(300), Ui.Px(32)); Cursor = Cursors.Hand; }
+        public DropDown()
+        {
+            Size = new Size(Ui.Px(280), Ui.Px(32));
+            Cursor = Cursors.Hand;
+            MakeFocusable();
+        }
 
         public void SetItems(IEnumerable<object> list, object selected)
         {
@@ -297,11 +443,10 @@ namespace SmartCamLight
 
         public object SelectedItem { get { return sel >= 0 && sel < items.Count ? items[sel] : null; } }
 
-        protected override void OnClick(EventArgs e)
+        void Open()
         {
-            base.OnClick(e);
+            if (items.Count == 0) return;
             var menu = new ContextMenuStrip();
-            MenuRenderer.Apply(menu);
             for (int i = 0; i < items.Count; i++)
             {
                 int idx = i;
@@ -312,23 +457,56 @@ namespace SmartCamLight
                     sel = idx; Invalidate();
                     if (SelectionChanged != null) SelectionChanged(this, EventArgs.Empty);
                 };
-                MenuRenderer.Style(mi);
                 menu.Items.Add(mi);
             }
+            MenuRenderer.Apply(menu, Ui.S);
             menu.MinimumSize = new Size(Width, 0);
             menu.Closed += delegate { BeginInvoke((MethodInvoker)menu.Dispose); };
-            menu.Show(this, new Point(0, Height + Ui.Px(2)));
+            menu.Show(this, new Point(0, Height + Ui.Px(4)));
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void OnClick(EventArgs e) { base.OnClick(e); Open(); }
+
+        protected override bool IsInputKey(Keys k) { return k == Keys.Down || base.IsInputKey(k); }
+
+        protected override void OnKeyDown(KeyEventArgs e)
         {
-            var g = Smooth(e);
-            var r = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
-            Ui.FillRound(g, pressed ? Ui.Pressed : hover ? Ui.Hover : Ui.Button, r, Ui.Px(5));
-            Ui.DrawRound(g, Ui.ButtonBorder, r, Ui.Px(5), 1f);
-            string text = SelectedItem != null ? SelectedItem.ToString() : "No camera";
-            Ui.DrawText(g, text, Ui.Body, Ui.Text, new Rectangle(Ui.Px(12), 0, Width - Ui.Px(44), Height), TextFormatFlags.VerticalCenter);
+            if (e.KeyCode == Keys.Space || e.KeyCode == Keys.Enter || e.KeyCode == Keys.Down) Open();
+            base.OnKeyDown(e);
+        }
+
+        protected override void Draw(Graphics g)
+        {
+            var r = Ui.Edge(Width, Height);
+            float rad = Ui.Px(4);
+            Ui.FillRound(g, pressed ? Ui.FillPressed : hover ? Ui.FillHover : Ui.Fill, r, rad);
+            Ui.Elevation(g, r, rad);
+            object item = SelectedItem;
+            Ui.DrawText(g, item != null ? item.ToString() : Placeholder, Ui.Body, item != null ? Ui.Text : Ui.Text2,
+                new Rectangle(Ui.Px(12), 0, Width - Ui.Px(44), Height - Ui.Px(1)), TextFormatFlags.VerticalCenter);
             Ui.Glyph(g, G.Chevron, Ui.IconSmall, Ui.Text2, new Rectangle(Width - Ui.Px(32), 0, Ui.Px(20), Height));
+            if (ShowFocus) Ui.FocusRing(g, new RectangleF(0, 0, Width, Height), rad);
+        }
+    }
+
+    // A native edit control draws without an alpha channel, so on a translucent backdrop it is
+    // given its own opaque layer.
+    class OpaqueTextBox : TextBox
+    {
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                if (Ui.Glass) cp.ExStyle |= 0x00080000;   // WS_EX_LAYERED
+                return cp;
+            }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            if (Ui.Glass) Ui.MakeOpaque(Handle);
         }
     }
 
@@ -338,10 +516,10 @@ namespace SmartCamLight
 
         public InputBox()
         {
-            Height = Ui.Px(34);
-            Box = new TextBox { BorderStyle = BorderStyle.None, BackColor = Ui.Input, ForeColor = Ui.Text, Font = Ui.Body };
-            Box.GotFocus += delegate { Invalidate(); };
-            Box.LostFocus += delegate { Invalidate(); };
+            Height = Ui.Px(32);
+            Box = new OpaqueTextBox { BorderStyle = BorderStyle.None, BackColor = Ui.Input, ForeColor = Ui.Text, Font = Ui.Body };
+            Box.GotFocus += delegate { Box.BackColor = Ui.InputFocus; Invalidate(); };
+            Box.LostFocus += delegate { Box.BackColor = Ui.Input; Invalidate(); };
             Controls.Add(Box);
             Cursor = Cursors.IBeam;
         }
@@ -354,94 +532,241 @@ namespace SmartCamLight
 
         protected override void OnClick(EventArgs e) { Box.Focus(); base.OnClick(e); }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void Draw(Graphics g)
         {
-            var g = Smooth(e);
-            var r = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
-            Ui.FillRound(g, Ui.Input, r, Ui.Px(5));
-            Ui.DrawRound(g, Ui.ButtonBorder, r, Ui.Px(5), 1f);
+            var r = Ui.Edge(Width, Height);
+            float rad = Ui.Px(4);
             bool focus = Box.Focused;
-            float lh = focus ? Ui.Px(2) : 1;
-            g.SmoothingMode = SmoothingMode.None;
-            using (var b = new SolidBrush(focus ? Ui.Accent : Ui.Text3))
-                g.FillRectangle(b, Ui.Px(3), Height - lh - 1, Width - Ui.Px(6), lh);
+            using (var path = Ui.Round(r, rad))
+            {
+                using (var b = new SolidBrush(focus ? Ui.InputFocus : Ui.Input)) g.FillPath(b, path);
+                using (var pen = new Pen(Ui.InputStroke, Ui.Hair)) g.DrawPath(pen, path);
+                // Underline: a hairline at rest, a two-pixel accent line when focused.
+                var state = g.Save();
+                g.SetClip(new RectangleF(0, 0, Width, Height));
+                using (var outer = Ui.Round(new RectangleF(0, 0, Width, Height), rad)) g.SetClip(outer, CombineMode.Intersect);
+                float lh = focus ? Ui.Px(2) : Ui.Hair;
+                using (var b = new SolidBrush(focus ? Ui.Accent : Ui.InputLine)) g.FillRectangle(b, 0, Height - lh, Width, lh);
+                g.Restore(state);
+            }
         }
     }
 
-    // ---------------- Layout containers ----------------
-    class ScrollPage : Panel
+    // ---------------- Scrolling ----------------
+
+    // Thin overlay scroll indicator that widens under the pointer.
+    class ScrollIndicator : UiControl
     {
+        float pos;
+        int range, view, grab;
+        bool drag;
+        readonly Tween wide;
+        public event EventHandler Scrolled;
+
+        public ScrollIndicator() { wide = NewTween(0.35f); }
+
+        public float Position { get { return pos; } }
+
+        public void Set(float position, int scrollRange, int viewport)
+        {
+            if (position == pos && scrollRange == range && viewport == view) return;
+            pos = position; range = scrollRange; view = viewport;
+            Invalidate();
+        }
+
+        float Track { get { return Height - Ui.Px(8); } }
+        float Length { get { return Math.Max(Ui.Px(32), Track * view / Math.Max(1f, view + range)); } }
+
+        RectangleF Thumb()
+        {
+            float len = Length;
+            float y = Ui.Px(4) + (Track - len) * (range > 0 ? pos / range : 0);
+            float w = Ui.Px(2) + wide.Value * Ui.Px(4);
+            return new RectangleF(Width - Ui.Px(4) - w, y, w, len);
+        }
+
+        void MoveTo(float position)
+        {
+            pos = Math.Max(0, Math.Min(range, position));
+            Invalidate();
+            if (Scrolled != null) Scrolled(this, EventArgs.Empty);
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); wide.To(1); }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); if (!drag) wide.To(0); }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left || range <= 0) return;
+            RectangleF t = Thumb();
+            if (e.Y < t.Top) MoveTo(pos - view * 0.9f);
+            else if (e.Y > t.Bottom) MoveTo(pos + view * 0.9f);
+            else { drag = true; grab = e.Y - (int)t.Top; Capture = true; }
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (!drag) return;
+            float free = Track - Length;
+            if (free > 0) MoveTo((e.Y - grab - Ui.Px(4)) / free * range);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            drag = false; Capture = false;
+            if (!ClientRectangle.Contains(e.Location)) wide.To(0);
+        }
+
+        protected override void Draw(Graphics g)
+        {
+            if (range <= 0) return;
+            RectangleF t = Thumb();
+            Ui.FillRound(g, Ui.Rail, t, t.Width / 2);
+        }
+    }
+
+    // A vertically scrolling page of full-width items.
+    class ScrollPage : Backdrop
+    {
+        readonly Backdrop content = new Backdrop();
+        readonly ScrollIndicator bar = new ScrollIndicator();
         readonly List<Control> items = new List<Control>();
         readonly Dictionary<Control, int> gaps = new Dictionary<Control, int>();
+        readonly Timer anim = new Timer { Interval = 15 };
+        float pos, target, enter;
+        int total;
 
         public ScrollPage()
         {
-            AutoScroll = true; BackColor = Ui.Back; Dock = DockStyle.Fill; DoubleBuffered = true;
+            Dock = DockStyle.Fill;
+            Controls.Add(bar);       // first child = topmost
+            Controls.Add(content);
+            bar.Scrolled += delegate { pos = target = bar.Position; Place(); };
+            anim.Tick += delegate
+            {
+                pos += (target - pos) * 0.3f;
+                if (Math.Abs(target - pos) < 0.5f) pos = target;
+                enter *= 0.72f;
+                if (enter < 0.5f) enter = 0;
+                if (pos == target && enter == 0) anim.Stop();
+                Place();
+            };
         }
+
+        int Range { get { return Math.Max(0, total - ClientSize.Height); } }
 
         public T Add<T>(T c, int gapBefore) where T : Control
         {
             items.Add(c); gaps[c] = Ui.Px(gapBefore);
-            Controls.Add(c);
+            content.Controls.Add(c);
             return c;
         }
 
         public void ClearItems(int keep)
         {
-            SuspendLayout();
+            content.SuspendLayout();
             while (items.Count > keep)
             {
                 Control c = items[items.Count - 1];
                 items.RemoveAt(items.Count - 1); gaps.Remove(c);
-                Controls.Remove(c); c.Dispose();
+                content.Controls.Remove(c); c.Dispose();
             }
-            ResumeLayout();
+            content.ResumeLayout();
         }
 
         public void Relayout()
         {
-            int padL = Ui.Px(12), padR = Ui.Px(28);
-            int w = Math.Min(ClientSize.Width - padL - padR, Ui.Px(860));
+            int padL = Ui.Px(20), padR = Ui.Px(32);
+            int w = Math.Min(ClientSize.Width - padL - padR, Ui.Px(1000));
             if (w <= 0) return;
-            int y = Ui.Px(14);
-            SuspendLayout();
+            int y = Ui.Px(4);
+            content.SuspendLayout();
             foreach (var c in items)
             {
                 y += gaps[c];
                 var ah = c as IAutoHeight;
                 int h = ah != null ? ah.MeasureHeight(w) : c.Height;
-                c.SetBounds(padL, y + AutoScrollPosition.Y, w, h);
+                c.SetBounds(padL, y, w, h);
                 y += h;
             }
-            AutoScrollMinSize = new Size(0, y + Ui.Px(28));
-            ResumeLayout();
+            total = y + Ui.Px(24);
+            content.ResumeLayout(false);
+            target = Math.Max(0, Math.Min(Range, target));
+            pos = Math.Max(0, Math.Min(Range, pos));
+            Place();
             foreach (var c in items) c.PerformLayout();
         }
 
+        void Place()
+        {
+            content.SetBounds(0, (int)Math.Round(enter - pos), ClientSize.Width, Math.Max(1, total));
+            bar.SetBounds(ClientSize.Width - Ui.Px(14), 0, Ui.Px(14), ClientSize.Height);
+            bar.Visible = Range > 0;
+            bar.Set(pos, Range, ClientSize.Height);
+        }
+
+        public void Wheel(int delta)
+        {
+            if (Range <= 0) return;
+            target = Math.Max(0, Math.Min(Range, target - delta / 120f * Ui.Px(110)));
+            anim.Start();
+        }
+
+        // Slides the content up into place, like a page transition in Windows 11 apps.
+        public void PlayEntrance()
+        {
+            pos = target = 0;
+            enter = Ui.Px(36);
+            Place();
+            anim.Start();
+        }
+
+        public void EnsureVisible(Control c)
+        {
+            if (c == null || !content.Contains(c)) return;
+            int top = content.PointToClient(c.PointToScreen(Point.Empty)).Y;
+            int margin = Ui.Px(24);
+            float t = target;
+            if (top - margin < t || c.Height + 2 * margin > ClientSize.Height) t = top - margin;   // too tall: show its top
+            else if (top + c.Height + margin > t + ClientSize.Height) t = top + c.Height + margin - ClientSize.Height;
+            t = Math.Max(0, Math.Min(Range, t));
+            if (t != target) { target = t; anim.Start(); }
+        }
+
         protected override void OnClientSizeChanged(EventArgs e) { base.OnClientSizeChanged(e); Relayout(); }
-        protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Ui.ThemeScrollbars(this); }
-        protected override Point ScrollToControl(Control activeControl) { return DisplayRectangle.Location; }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) anim.Dispose();
+            base.Dispose(disposing);
+        }
     }
 
-    class Card : Panel, IAutoHeight
+    // ---------------- Cards and rows ----------------
+
+    // A translucent layer holding one or more rows, separated by hairlines.
+    class Card : UiControl, IAutoHeight
     {
         readonly List<Control> rows = new List<Control>();
         readonly List<int> dividers = new List<int>();
 
-        public Card()
-        {
-            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-            BackColor = Ui.Back;
-        }
+        // Horizontal padding rows keep from the card's edge (rows span the card so that
+        // right-aligned controls have room for their focus ring).
+        public static int RowPad { get { return Ui.Px(15); } }
 
         public T Add<T>(T row) where T : Control
         {
-            row.BackColor = Ui.Card;
             rows.Add(row); Controls.Add(row);
+            var u = row as UiControl;
+            if (u != null) u.OnCard = true;
             return row;
         }
 
-        int PadX { get { return Ui.Px(16); } }
+        static int Line { get { return (int)Ui.Hair; } }
+        static int PadY { get { return Ui.Px(4); } }   // keeps rows clear of the rounded corners
 
         static int RowHeight(Control c, int w)
         {
@@ -449,45 +774,50 @@ namespace SmartCamLight
             return ah != null ? ah.MeasureHeight(w) : c.Height;
         }
 
+        // A row that measures zero high is collapsed: it takes no space and gets no divider.
         public int MeasureHeight(int width)
         {
-            int inner = width - 2 * PadX, h = Ui.Px(2) * 2;
-            for (int i = 0; i < rows.Count; i++) h += RowHeight(rows[i], inner) + (i > 0 ? 1 : 0);
+            int inner = width - 2 * Line, h = 2 * PadY, shown = 0;
+            foreach (Control row in rows)
+            {
+                int rh = RowHeight(row, inner);
+                if (rh <= 0) continue;
+                h += rh + (shown > 0 ? Line : 0);
+                shown++;
+            }
             return h;
         }
 
         protected override void OnLayout(LayoutEventArgs e)
         {
-            int w = Width - 2 * PadX, y = Ui.Px(2);
+            int w = Width - 2 * Line, y = PadY, shown = 0;
             dividers.Clear();
-            for (int i = 0; i < rows.Count; i++)
+            foreach (Control row in rows)
             {
-                if (i > 0) { dividers.Add(y); y += 1; }
-                int h = RowHeight(rows[i], w);
-                rows[i].SetBounds(PadX, y, w, h);
+                int h = RowHeight(row, w);
+                if (h <= 0) { row.SetBounds(Line, y, w, 0); continue; }
+                if (shown > 0) { dividers.Add(y); y += Line; }
+                row.SetBounds(Line, y, w, h);
                 y += h;
+                shown++;
             }
             base.OnLayout(e);
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void Draw(Graphics g)
         {
-            var g = e.Graphics;
-            using (var b = new SolidBrush(Ui.Back)) g.FillRectangle(b, ClientRectangle);
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            var r = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
-            Ui.FillRound(g, Ui.Card, r, Ui.Px(8));
-            Ui.DrawRound(g, Ui.CardBorder, r, Ui.Px(8), 1f);
-            g.SmoothingMode = SmoothingMode.None;
-            using (var p = new Pen(Ui.Divider))
-                foreach (int y in dividers) g.DrawLine(p, 1, y, Width - 2, y);
+            var r = Ui.Edge(Width, Height);
+            float rad = Ui.Px(4);
+            Ui.FillRound(g, Ui.Card, r, rad);
+            Ui.DrawRound(g, Ui.CardStroke, r, rad, Ui.Hair);
+            using (var b = new SolidBrush(Ui.Divider))
+                foreach (int y in dividers) g.FillRectangle(b, Line, y, Width - 2 * Line, Line);
         }
     }
 
-    // ---------------- Rows ----------------
     class TextBlock : UiControl, IAutoHeight
     {
-        readonly Font font; Color color; readonly int padTop, padBottom;
+        readonly Font font; readonly Color color; readonly int padTop, padBottom;
 
         public TextBlock(string text, Font font, Color color, int padTop, int padBottom)
         {
@@ -496,9 +826,9 @@ namespace SmartCamLight
 
         public int MeasureHeight(int width) { return padTop + Ui.Measure(Text, font, width, true).Height + padBottom; }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void Draw(Graphics g)
         {
-            Ui.DrawText(e.Graphics, Text, font, color, new Rectangle(0, padTop, Width, Height - padTop), TextFormatFlags.WordBreak);
+            Ui.DrawText(g, Text, font, color, new Rectangle(0, padTop, Width, Height - padTop), TextFormatFlags.WordBreak);
         }
     }
 
@@ -515,35 +845,49 @@ namespace SmartCamLight
 
         public void SetText(string newTitle, string newDesc) { title = newTitle; desc = newDesc; Invalidate(); }
 
-        int TextLeft { get { return glyph != null ? Ui.Px(40) : 0; } }
-        int TextWidth(int w) { return w - TextLeft - (accessory != null ? accessory.Width + Ui.Px(20) : 0); }
+        static int Pad { get { return Card.RowPad; } }
+        int TextLeft { get { return Pad + (glyph != null ? Ui.Px(40) : 0); } }
+        int TextWidth(int w) { return w - TextLeft - Pad - (accessory != null ? accessory.Width + Ui.Px(16) : 0); }
+
+        // A dropdown gives way in a narrow window so the label keeps a readable width.
+        void FitAccessory(int width)
+        {
+            if (!(accessory is DropDown)) return;
+            int room = width - TextLeft - Pad - Ui.Px(16) - Ui.Px(150);
+            accessory.Width = Math.Max(Ui.Px(120), Math.Min(Ui.Px(280), room));
+        }
 
         public int MeasureHeight(int width)
         {
-            int th = Ui.Measure(title, Ui.Strong, 0, false).Height;
-            int dh = string.IsNullOrEmpty(desc) ? 0 : Ui.Measure(desc, Ui.Small, TextWidth(width), true).Height + Ui.Px(3);
-            int h = th + dh + Ui.Px(28);
-            if (accessory != null) h = Math.Max(h, accessory.Height + Ui.Px(24));
-            return Math.Max(h, Ui.Px(string.IsNullOrEmpty(desc) ? 52 : 62));
+            FitAccessory(width);
+            int th = Ui.Measure(title, Ui.Body, 0, false).Height;
+            int dh = string.IsNullOrEmpty(desc) ? 0 : Ui.Measure(desc, Ui.Small, TextWidth(width), true).Height + Ui.Px(2);
+            int h = th + dh + Ui.Px(24);
+            if (accessory != null) h = Math.Max(h, accessory.Height + Ui.Px(20));
+            return Math.Max(h, Ui.Px(60));
         }
 
         protected override void OnLayout(LayoutEventArgs e)
         {
-            if (accessory != null) accessory.Location = new Point(Width - accessory.Width, (Height - accessory.Height) / 2);
+            if (accessory != null)
+            {
+                FitAccessory(Width);
+                int inset = accessory is Toggle ? Toggle.Inset : 0;
+                accessory.Location = new Point(Width - Pad - accessory.Width + inset, (Height - accessory.Height) / 2);
+            }
             base.OnLayout(e);
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void Draw(Graphics g)
         {
-            var g = e.Graphics;
-            if (glyph != null) Ui.Glyph(g, glyph, Ui.Icon, Ui.Text, new Rectangle(0, 0, Ui.Px(24), Height));
-            int th = Ui.Measure(title, Ui.Strong, 0, false).Height;
+            if (glyph != null) Ui.Glyph(g, glyph, Ui.Icon, Ui.Text, new Rectangle(Pad, 0, Ui.Px(20), Height));
+            int th = Ui.Measure(title, Ui.Body, 0, false).Height;
             int tw = TextWidth(Width);
-            int dh = string.IsNullOrEmpty(desc) ? 0 : Ui.Measure(desc, Ui.Small, tw, true).Height + Ui.Px(3);
+            int dh = string.IsNullOrEmpty(desc) ? 0 : Ui.Measure(desc, Ui.Small, tw, true).Height + Ui.Px(2);
             int y = (Height - th - dh) / 2;
-            Ui.DrawText(g, title, Ui.Strong, Ui.Text, new Rectangle(TextLeft, y, tw, th + 2), TextFormatFlags.Default);
+            Ui.DrawText(g, title, Ui.Body, Ui.Text, new Rectangle(TextLeft, y, tw, th + 2), TextFormatFlags.Default);
             if (dh > 0)
-                Ui.DrawText(g, desc, Ui.Small, Ui.Text2, new Rectangle(TextLeft, y + th + Ui.Px(3), tw, dh + 2), TextFormatFlags.WordBreak);
+                Ui.DrawText(g, desc, Ui.Small, Ui.Text2, new Rectangle(TextLeft, y + th + Ui.Px(2), tw, dh + 2), TextFormatFlags.WordBreak);
         }
     }
 
@@ -569,37 +913,38 @@ namespace SmartCamLight
             }
         }
 
-        int TextLeft { get { return glyph != null ? Ui.Px(40) : 0; } }
-        int TopLine { get { return Ui.Px(14); } }
-        int LineH { get { return Ui.Px(22); } }
+        static int Pad { get { return Card.RowPad; } }
+        int TextLeft { get { return Pad + (glyph != null ? Ui.Px(40) : 0); } }
+        static int TopLine { get { return Ui.Px(10); } }
+        static int LineH { get { return Ui.Px(24); } }
 
-        public int MeasureHeight(int width) { return Ui.Px(80); }
+        public int MeasureHeight(int width) { return Ui.Px(76); }
 
         protected override void OnLayout(LayoutEventArgs e)
         {
-            int x = Math.Max(0, TextLeft - Ui.Px(10));
-            Slider.SetBounds(x, TopLine + LineH + Ui.Px(8), Width - x, Ui.Px(28));
-            if (Auto != null) Auto.Location = new Point(Width - Auto.Width, TopLine + (LineH - Auto.Height) / 2);
+            // The track starts under the title and ends at the row's right padding.
+            int x = TextLeft - ModernSlider.Inset;
+            Slider.SetBounds(x, TopLine + LineH + Ui.Px(2), Width - Pad - x + ModernSlider.Inset, Slider.Height);
+            if (Auto != null) Auto.Location = new Point(Width - Pad - Auto.Width + Toggle.Inset, TopLine + (LineH - Auto.Height) / 2);
             base.OnLayout(e);
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void Draw(Graphics g)
         {
-            var g = e.Graphics;
-            if (glyph != null) Ui.Glyph(g, glyph, Ui.Icon, Ui.Text, new Rectangle(0, TopLine, Ui.Px(24), LineH));
-            Ui.DrawText(g, title, Ui.Strong, Ui.Text, new Rectangle(TextLeft, TopLine, Width / 2, LineH), TextFormatFlags.VerticalCenter);
+            if (glyph != null) Ui.Glyph(g, glyph, Ui.Icon, Enabled ? Ui.Text : Ui.TextDisabled, new Rectangle(Pad, TopLine, Ui.Px(20), LineH));
+            Ui.DrawText(g, title, Ui.Body, Enabled ? Ui.Text : Ui.TextDisabled, new Rectangle(TextLeft, TopLine, Width / 2, LineH), TextFormatFlags.VerticalCenter);
 
-            int right = Width;
+            int right = Width - Pad;
             if (Auto != null)
             {
-                right = Auto.Left - Ui.Px(8);
+                right = Auto.Left + Toggle.Inset - Ui.Px(10);
                 int aw = Ui.Measure("Auto", Ui.Small, 0, false).Width;
                 Ui.DrawText(g, "Auto", Ui.Small, Ui.Text2, new Rectangle(right - aw, TopLine, aw + 2, LineH), TextFormatFlags.VerticalCenter);
-                right -= aw + Ui.Px(18);
+                right -= aw + Ui.Px(16);
             }
             string val = Format(Slider.Value);
-            Color vc = Auto != null && Auto.Checked ? Ui.Text3 : Ui.Text2;
-            Ui.DrawText(g, val, Ui.Body, vc, new Rectangle(right - Ui.Px(160), TopLine, Ui.Px(160), LineH),
+            Color vc = !Enabled || (Auto != null && Auto.Checked) ? Ui.Text3 : Ui.Text2;
+            Ui.DrawText(g, val, Ui.Body, vc, new Rectangle(right - Ui.Px(180), TopLine, Ui.Px(180), LineH),
                 TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
         }
     }
@@ -619,22 +964,36 @@ namespace SmartCamLight
             return b;
         }
 
-        public int MeasureHeight(int width) { return Ui.Px(54); }
+        static int Left0 { get { return Card.RowPad + Ui.Px(40); } }
+
+        static int LineH { get { return Ui.Px(28); } }
+        static int PadY { get { return Ui.Px(12); } }
+
+        // Chips flow onto further lines when the row is too narrow for all of them.
+        int Flow(int width, bool place)
+        {
+            int x0 = Left0 + Ui.Measure(label, Ui.Small, 0, false).Width + Ui.Px(16);
+            int x = x0, line = 0, gap = Ui.Px(8);
+            foreach (var c in Chips)
+            {
+                if (x > x0 && x + c.Width > width - Card.RowPad) { x = x0; line++; }
+                if (place) c.Location = new Point(x, PadY + line * (LineH + gap));
+                x += c.Width + gap;
+            }
+            return PadY + (line + 1) * LineH + line * gap + PadY;
+        }
+
+        public int MeasureHeight(int width) { return Flow(width, false); }
 
         protected override void OnLayout(LayoutEventArgs e)
         {
-            int x = Ui.Px(40) + Ui.Measure(label, Ui.Small, 0, false).Width + Ui.Px(16);
-            foreach (var c in Chips)
-            {
-                c.Location = new Point(x, (Height - c.Height) / 2);
-                x += c.Width + Ui.Px(8);
-            }
+            Flow(Width, true);
             base.OnLayout(e);
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void Draw(Graphics g)
         {
-            Ui.DrawText(e.Graphics, label, Ui.Small, Ui.Text2, new Rectangle(Ui.Px(40), 0, Ui.Px(120), Height), TextFormatFlags.VerticalCenter);
+            Ui.DrawText(g, label, Ui.Small, Ui.Text2, new Rectangle(Left0, PadY, Ui.Px(120), LineH), TextFormatFlags.VerticalCenter);
         }
     }
 
@@ -649,190 +1008,358 @@ namespace SmartCamLight
             Controls.Add(Input);
         }
 
-        int TextLeft { get { return glyph != null ? Ui.Px(40) : 0; } }
+        static int Pad { get { return Card.RowPad; } }
+        int TextLeft { get { return Pad + (glyph != null ? Ui.Px(40) : 0); } }
 
         int TextBlockHeight(int width)
         {
-            return Ui.Measure(title, Ui.Strong, 0, false).Height + Ui.Px(3) + Ui.Measure(desc, Ui.Small, width - TextLeft, true).Height;
+            return Ui.Measure(title, Ui.Body, 0, false).Height + Ui.Px(2) + Ui.Measure(desc, Ui.Small, width - TextLeft - Pad, true).Height;
         }
 
-        public int MeasureHeight(int width) { return Ui.Px(14) + TextBlockHeight(width) + Ui.Px(12) + Input.Height + Ui.Px(16); }
+        public int MeasureHeight(int width) { return Ui.Px(12) + TextBlockHeight(width) + Ui.Px(12) + Input.Height + Ui.Px(14); }
 
         protected override void OnLayout(LayoutEventArgs e)
         {
-            Input.SetBounds(TextLeft, Ui.Px(14) + TextBlockHeight(Width) + Ui.Px(12), Width - TextLeft, Input.Height);
+            Input.SetBounds(TextLeft, Ui.Px(12) + TextBlockHeight(Width) + Ui.Px(12), Width - TextLeft - Pad, Input.Height);
             base.OnLayout(e);
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void Draw(Graphics g)
         {
-            var g = e.Graphics;
-            int y = Ui.Px(14);
-            int th = Ui.Measure(title, Ui.Strong, 0, false).Height;
-            if (glyph != null) Ui.Glyph(g, glyph, Ui.Icon, Ui.Text, new Rectangle(0, y, Ui.Px(24), th));
-            Ui.DrawText(g, title, Ui.Strong, Ui.Text, new Rectangle(TextLeft, y, Width - TextLeft, th + 2), TextFormatFlags.Default);
-            Ui.DrawText(g, desc, Ui.Small, Ui.Text2, new Rectangle(TextLeft, y + th + Ui.Px(3), Width - TextLeft, Ui.Px(60)), TextFormatFlags.WordBreak);
+            int y = Ui.Px(12);
+            int th = Ui.Measure(title, Ui.Body, 0, false).Height;
+            int w = Width - TextLeft - Pad;
+            if (glyph != null) Ui.Glyph(g, glyph, Ui.Icon, Ui.Text, new Rectangle(Pad, y, Ui.Px(20), th));
+            Ui.DrawText(g, title, Ui.Body, Ui.Text, new Rectangle(TextLeft, y, w, th + 2), TextFormatFlags.Default);
+            Ui.DrawText(g, desc, Ui.Small, Ui.Text2, new Rectangle(TextLeft, y + th + Ui.Px(2), w, Ui.Px(80)), TextFormatFlags.WordBreak);
+        }
+    }
+
+    // The live camera picture as a row in a card. It has no height while the preview is off.
+    class PreviewPane : UiControl, IAutoHeight
+    {
+        CameraFeed feed;
+        string notice;
+        bool open;
+
+        public void Set(CameraFeed newFeed, string newNotice, bool isOpen)
+        {
+            feed = newFeed; notice = newNotice; open = isOpen;
+            Invalidate();
+        }
+
+        // Width, in pixels, of a 16:9 picture in the pane.
+        public static int ShownWidth { get { return Ui.Px(240) * 16 / 9; } }
+
+        // The picture keeps the camera's own proportions (16:9 until the first frame arrives).
+        Size VideoSize(int width)
+        {
+            Size f = feed != null ? feed.FrameSize : Size.Empty;
+            float aspect = f.IsEmpty ? 16f / 9f : f.Width / (float)f.Height;
+            int h = Ui.Px(240), w = (int)Math.Round(h * aspect), max = Math.Max(1, width - 2 * Card.RowPad);
+            if (w > max) { w = max; h = (int)Math.Round(w / aspect); }
+            return new Size(w, h);
+        }
+
+        public int MeasureHeight(int width) { return open ? Ui.Px(8) + VideoSize(width).Height + Ui.Px(16) : 0; }
+
+        protected override void Draw(Graphics g)
+        {
+            if (!open) return;
+            Size v = VideoSize(Width);
+            var r = new RectangleF((Width - v.Width) / 2, Ui.Px(8), v.Width, v.Height);
+            float rad = Ui.Px(6);
+            Ui.FillRound(g, Color.FromArgb(16, 16, 16), r, rad);
+
+            string message = notice;
+            if (feed != null)
+            {
+                if (feed.Error != null) message = feed.Error;
+                else if (!feed.Draw(g, r, rad)) message = "Starting the camera…";
+            }
+            if (message == null) return;
+            Rectangle box = Rectangle.Round(RectangleF.Inflate(r, -Ui.Px(24), -Ui.Px(12)));
+            int th = Math.Min(box.Height, Ui.Measure(message, Ui.Body, box.Width, true).Height);
+            Ui.DrawText(g, message, Ui.Body, Color.FromArgb(208, 208, 208),
+                new Rectangle(box.X, box.Y + (box.Height - th) / 2, box.Width, th + 2), TextFormatFlags.HorizontalCenter | TextFormatFlags.WordBreak);
         }
     }
 
     // ---------------- Light hero ----------------
-    class PowerButton : UiControl
+
+    // The light's status with its power button. While the light is on, the card carries a wash
+    // of the light's own colour, stronger the brighter the light is set.
+    class HeroCard : UiControl, IAutoHeight
     {
-        public bool On, Available = true;
-        public int Kelvin = 4500, Brightness = 50;
-
-        public PowerButton() { Cursor = Cursors.Hand; }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            var g = Smooth(e);
-            float d = Math.Min(Width, Height);
-            float cx = Width / 2f, cy = Height / 2f;
-            float r = d * 0.34f;
-
-            if (On && Available)
-            {
-                Color lc = Ui.Kelvin(Kelvin);
-                float hr = d * 0.5f;
-                using (var path = new GraphicsPath())
-                {
-                    path.AddEllipse(cx - hr, cy - hr, hr * 2, hr * 2);
-                    using (var pg = new PathGradientBrush(path))
-                    {
-                        int a = 70 + Brightness * 110 / 100;
-                        pg.CenterColor = Color.FromArgb(a, lc);
-                        pg.SurroundColors = new[] { Color.FromArgb(0, lc) };
-                        pg.FocusScales = new PointF(0.55f, 0.55f);
-                        g.FillPath(pg, path);
-                    }
-                }
-                Color fill = Ui.Blend(lc, Color.White, hover ? 0.35f : 0.2f);
-                using (var b = new SolidBrush(fill)) g.FillEllipse(b, cx - r, cy - r, r * 2, r * 2);
-                Ui.Glyph(g, G.Power, Ui.IconLarge, Ui.Hex("#2A2418"), new Rectangle((int)(cx - r), (int)(cy - r), (int)(r * 2), (int)(r * 2)));
-            }
-            else
-            {
-                using (var b = new SolidBrush(hover && Available ? Ui.Hover : Ui.Button)) g.FillEllipse(b, cx - r, cy - r, r * 2, r * 2);
-                using (var p = new Pen(Ui.ButtonBorder, Math.Max(1f, 1.5f * Ui.S))) g.DrawEllipse(p, cx - r, cy - r, r * 2, r * 2);
-                Ui.Glyph(g, G.Power, Ui.IconLarge, Available ? Ui.Text2 : Ui.Text3, new Rectangle((int)(cx - r), (int)(cy - r), (int)(r * 2), (int)(r * 2)));
-            }
-        }
-    }
-
-    class HeroRow : UiControl, IAutoHeight
-    {
-        public readonly PowerButton Power = new PowerButton();
+        bool on, available = true, overButton, downOnButton;
+        int kelvin = 4500, brightness = 50;
         string title = "", sub = "", status = "";
         Color dot;
+        readonly Tween glow;
+        public event EventHandler PowerClicked;
 
-        public HeroRow() { Controls.Add(Power); }
+        public HeroCard()
+        {
+            glow = NewTween(0.18f);
+            MakeFocusable();
+        }
 
         public void SetInfo(string t, string s, string st, Color dotColor)
         {
             title = t; sub = s; status = st; dot = dotColor; Invalidate();
         }
 
-        public int MeasureHeight(int width) { return Ui.Px(156); }
-
-        protected override void OnLayout(LayoutEventArgs e)
+        public void SetState(bool lightOn, bool lightAvailable, int lightKelvin, int lightBrightness)
         {
-            int size = Ui.Px(140);
-            Power.SetBounds(-Ui.Px(10), (Height - size) / 2, size, size);
-            base.OnLayout(e);
+            on = lightOn; available = lightAvailable; kelvin = lightKelvin; brightness = lightBrightness;
+            glow.To(on && available ? 1 : 0);
+            Invalidate();
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        public int MeasureHeight(int width) { return Ui.Px(132); }
+
+        RectangleF ButtonRect
         {
-            var g = e.Graphics;
-            int x = Ui.Px(140);
+            get { float d = Ui.Px(72); return new RectangleF(Ui.Px(28), (Height - d) / 2f, d, d); }
+        }
+
+        bool Hit(Point p)
+        {
+            RectangleF b = ButtonRect;
+            float dx = p.X - (b.X + b.Width / 2), dy = p.Y - (b.Y + b.Height / 2), r = b.Width / 2;
+            return dx * dx + dy * dy <= r * r;
+        }
+
+        void RaisePower()
+        {
+            if (available && PowerClicked != null) PowerClicked(this, EventArgs.Empty);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            bool over = available && Hit(e.Location);
+            if (over == overButton) return;
+            overButton = over;
+            Cursor = over ? Cursors.Hand : Cursors.Default;
+            Invalidate();
+        }
+
+        protected override void OnMouseLeave(EventArgs e) { overButton = false; downOnButton = false; base.OnMouseLeave(e); }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            downOnButton = e.Button == MouseButtons.Left && available && Hit(e.Location);
+            base.OnMouseDown(e);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            bool click = downOnButton && Hit(e.Location);
+            downOnButton = false;
+            base.OnMouseUp(e);
+            if (click) RaisePower();
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Space || e.KeyCode == Keys.Enter) RaisePower();
+            base.OnKeyDown(e);
+        }
+
+        protected override void Draw(Graphics g)
+        {
+            RectangleF b = ButtonRect;
+            float cx = b.X + b.Width / 2, cy = b.Y + b.Height / 2, rad = Ui.Px(8);
+
+            using (var path = Ui.Round(Ui.Edge(Width, Height), rad))
+            {
+                using (var fill = new SolidBrush(Ui.Card)) g.FillPath(fill, path);
+                if (glow.Value > 0.01f)
+                {
+                    var state = g.Save();
+                    g.SetClip(path, CombineMode.Intersect);
+                    float reach = Math.Max(Ui.Px(240), Width * 0.62f);
+                    float strength = glow.Value * (0.35f + 0.65f * brightness / 100f);
+                    Color tint = Ui.Tint(kelvin);
+                    using (var gp = new GraphicsPath())
+                    {
+                        gp.AddEllipse(cx - reach, cy - reach, reach * 2, reach * 2);
+                        using (var pg = new PathGradientBrush(gp))
+                        {
+                            pg.CenterPoint = new PointF(cx, cy);
+                            pg.CenterColor = Color.FromArgb((int)((Ui.Dark ? 120 : 170) * strength), tint);
+                            pg.SurroundColors = new[] { Color.FromArgb(0, tint) };
+                            g.FillPath(pg, gp);
+                        }
+                    }
+                    g.Restore(state);
+                }
+                using (var pen = new Pen(Ui.CardStroke, Ui.Hair)) g.DrawPath(pen, path);
+            }
+
+            // Power button: accent-filled while the light is on, like a toggled quick setting.
+            bool down = downOnButton && overButton;
+            Color glyph;
+            if (on && available)
+            {
+                using (var br = new SolidBrush(down ? Ui.AccentPressed : overButton ? Ui.AccentHover : Ui.Accent)) g.FillEllipse(br, b);
+                glyph = Ui.OnAccent;
+            }
+            else
+            {
+                var e = new RectangleF(b.X + Ui.Hair / 2, b.Y + Ui.Hair / 2, b.Width - Ui.Hair, b.Height - Ui.Hair);
+                using (var br = new SolidBrush(!available ? Ui.FillDisabled : down ? Ui.FillPressed : overButton ? Ui.FillHover : Ui.Fill)) g.FillEllipse(br, e);
+                using (var pen = new Pen(Ui.Dark ? Ui.StrokeEdge : Ui.Stroke, Ui.Hair)) g.DrawEllipse(pen, e);
+                glyph = available ? Ui.Text : Ui.TextDisabled;
+            }
+            Ui.Glyph(g, G.Power, Ui.IconLarge, glyph, Rectangle.Round(b));
+            if (ShowFocus) Ui.FocusRing(g, RectangleF.Inflate(b, Ui.Px(4), Ui.Px(4)), b.Width / 2 + Ui.Px(4));
+
+            int x = (int)b.Right + Ui.Px(24);
             int th = Ui.Measure(title, Ui.HeroTitle, 0, false).Height;
             int sh = Ui.Measure(sub, Ui.Body, 0, false).Height;
             int lh = Ui.Measure(status, Ui.Small, 0, false).Height;
-            int y = (Height - (th + Ui.Px(4) + sh + Ui.Px(14) + lh)) / 2;
-            Ui.DrawText(g, title, Ui.HeroTitle, Ui.Text, new Rectangle(x, y, Width - x, th + 2), TextFormatFlags.Default);
-            y += th + Ui.Px(4);
-            Ui.DrawText(g, sub, Ui.Body, Ui.Text2, new Rectangle(x, y, Width - x, sh + 2), TextFormatFlags.Default);
-            y += sh + Ui.Px(14);
-
-            // status pill
-            int pw = Ui.Measure(status, Ui.Small, 0, false).Width + Ui.Px(30);
             int ph = lh + Ui.Px(10);
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            Ui.FillRound(g, Ui.Dark ? Ui.Hex("#333333") : Ui.Hex("#EFEFEF"), new RectangleF(x, y - Ui.Px(5), pw, ph), ph / 2f);
+            int y = (Height - (th + Ui.Px(2) + sh + Ui.Px(12) + ph)) / 2;
+            int w = Width - x - Ui.Px(20);
+            Ui.DrawText(g, title, Ui.HeroTitle, Ui.Text, new Rectangle(x, y, w, th + 2), TextFormatFlags.Default);
+            y += th + Ui.Px(2);
+            Ui.DrawText(g, sub, Ui.Body, Ui.Text2, new Rectangle(x, y, w, sh + 2), TextFormatFlags.Default);
+            y += sh + Ui.Px(12);
+
+            // Status pill
+            int tw = Math.Min(Ui.Measure(status, Ui.Small, 0, false).Width, w - Ui.Px(34));
+            int pw = tw + Ui.Px(34);
+            Ui.FillRound(g, Ui.Pill, new RectangleF(x, y, pw, ph), ph / 2f);
             float dr = Ui.Px(3.5f);
-            using (var b = new SolidBrush(dot)) g.FillEllipse(b, x + Ui.Px(10), y - Ui.Px(5) + ph / 2f - dr, dr * 2, dr * 2);
-            Ui.DrawText(g, status, Ui.Small, Ui.Text2, new Rectangle(x + Ui.Px(22), y - Ui.Px(5), pw, ph), TextFormatFlags.VerticalCenter);
+            using (var br = new SolidBrush(dot)) g.FillEllipse(br, x + Ui.Px(11), y + ph / 2f - dr, dr * 2, dr * 2);
+            Ui.DrawText(g, status, Ui.Small, Ui.Text2, new Rectangle(x + Ui.Px(24), y, tw + 2, ph - Ui.Px(1)), TextFormatFlags.VerticalCenter);
         }
     }
 
-    // ---------------- Sidebar ----------------
-    class NavButton : UiControl
+    // ---------------- Navigation pane ----------------
+
+    // Left-hand navigation in the style of a Windows 11 NavigationView: the selection pill slides
+    // between items. The foot of the pane shows the live camera and light status.
+    class NavPane : UiControl
     {
-        readonly string glyph;
-        bool selected;
-
-        public NavButton(string glyph, string text)
-        {
-            this.glyph = glyph; Text = text;
-            Height = Ui.Px(38);
-            Cursor = Cursors.Hand;
-        }
-
-        public bool Selected { get { return selected; } set { selected = value; Invalidate(); } }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            var g = Smooth(e);
-            var r = new RectangleF(Ui.Px(4), 1, Width - Ui.Px(8), Height - 2);
-            if (selected || hover)
-                Ui.FillRound(g, selected ? (Ui.Dark ? Ui.Hex("#2D2D2D") : Ui.Hex("#EAEAEA")) : (Ui.Dark ? Ui.Hex("#292929") : Ui.Hex("#EDEDED")), r, Ui.Px(5));
-            if (selected)
-                Ui.FillRound(g, Ui.Accent, new RectangleF(Ui.Px(4), Height / 2f - Ui.Px(8), Ui.Px(3), Ui.Px(16)), Ui.Px(1.5f));
-            Ui.Glyph(g, glyph, Ui.Icon, Ui.Text, new Rectangle(Ui.Px(16), 0, Ui.Px(22), Height));
-            Ui.DrawText(g, Text, Ui.Body, Ui.Text, new Rectangle(Ui.Px(50), 0, Width - Ui.Px(54), Height), TextFormatFlags.VerticalCenter);
-        }
-    }
-
-    class NavHeader : UiControl
-    {
-        public NavHeader() { Height = Ui.Px(64); }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            var g = Smooth(e);
-            int size = Ui.Px(30);
-            var state = g.Save();
-            g.TranslateTransform(Ui.Px(14), (Height - size) / 2f);
-            IconArt.Draw(g, size, true, false, false);
-            g.Restore(state);
-            Ui.DrawText(g, "SmartCamLight", Ui.Section, Ui.Text, new Rectangle(Ui.Px(54), 0, Width - Ui.Px(54), Height), TextFormatFlags.VerticalCenter);
-        }
-    }
-
-    class NavStatus : UiControl
-    {
+        readonly List<string> glyphs = new List<string>(), texts = new List<string>();
+        int selected = -1, hoverItem = -1, downItem = -1;
+        readonly Tween slide;
         string camText = "", lightText = "";
         Color camDot, lightDot;
+        public event EventHandler SelectedChanged;
 
-        public NavStatus() { Height = Ui.Px(70); }
+        public NavPane()
+        {
+            Dock = DockStyle.Left;
+            Width = Ui.Px(228);
+            slide = NewTween(0.28f);
+            MakeFocusable();
+        }
 
-        public void Set(string cam, Color camColor, string light, Color lightColor)
+        public void AddItem(string glyph, string text) { glyphs.Add(glyph); texts.Add(text); Invalidate(); }
+
+        public int SelectedIndex
+        {
+            get { return selected; }
+            set
+            {
+                if (value == selected || value < 0 || value >= texts.Count) return;
+                bool first = selected < 0;
+                selected = value;
+                if (first) slide.Jump(value); else slide.To(value);
+                Invalidate();
+            }
+        }
+
+        public void SetStatus(string cam, Color camColor, string light, Color lightColor)
         {
             camText = cam; camDot = camColor; lightText = light; lightDot = lightColor; Invalidate();
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        static int ItemH { get { return Ui.Px(36); } }
+        static int Pitch { get { return Ui.Px(40); } }
+        static int Top0 { get { return Ui.Px(8); } }
+
+        Rectangle ItemRect(int i) { return new Rectangle(Ui.Px(8), Top0 + i * Pitch, Width - Ui.Px(12), ItemH); }
+
+        int ItemAt(Point p)
         {
-            var g = Smooth(e);
-            Line(g, Ui.Px(12), camText, camDot);
-            Line(g, Ui.Px(36), lightText, lightDot);
+            for (int i = 0; i < texts.Count; i++) if (ItemRect(i).Contains(p)) return i;
+            return -1;
         }
 
-        void Line(Graphics g, int y, string text, Color dot)
+        void Select(int i)
+        {
+            if (i == selected || i < 0 || i >= texts.Count) return;
+            SelectedIndex = i;
+            if (SelectedChanged != null) SelectedChanged(this, EventArgs.Empty);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            int i = ItemAt(e.Location);
+            if (i == hoverItem) return;
+            hoverItem = i;
+            Cursor = i >= 0 ? Cursors.Hand : Cursors.Default;
+            Invalidate();
+        }
+
+        protected override void OnMouseLeave(EventArgs e) { hoverItem = -1; downItem = -1; base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs e) { downItem = e.Button == MouseButtons.Left ? ItemAt(e.Location) : -1; base.OnMouseDown(e); }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            int i = downItem;
+            downItem = -1;
+            base.OnMouseUp(e);
+            if (i >= 0 && i == ItemAt(e.Location)) Select(i);
+        }
+
+        protected override bool IsInputKey(Keys k) { return k == Keys.Up || k == Keys.Down || base.IsInputKey(k); }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Down) Select(selected + 1);
+            else if (e.KeyCode == Keys.Up) Select(selected - 1);
+            base.OnKeyDown(e);
+        }
+
+        protected override void Draw(Graphics g)
+        {
+            for (int i = 0; i < texts.Count; i++)
+            {
+                Rectangle r = ItemRect(i);
+                if (i == selected || i == hoverItem)
+                    Ui.FillRound(g, i == downItem ? Ui.SubtlePressed : Ui.Subtle, r, Ui.Px(4));
+                Ui.Glyph(g, glyphs[i], Ui.Icon, Ui.Text, new Rectangle(r.X + Ui.Px(10), r.Y, Ui.Px(24), r.Height));
+                Ui.DrawText(g, texts[i], Ui.Body, Ui.Text, new Rectangle(r.X + Ui.Px(46), r.Y, r.Width - Ui.Px(52), r.Height - Ui.Px(1)), TextFormatFlags.VerticalCenter);
+            }
+
+            if (selected >= 0)
+            {
+                // Selection pill: it stretches while it travels to the new item.
+                float travel = Math.Min(1f, Math.Abs(slide.Target - slide.Value));
+                float ph = Ui.Px(16) + travel * Ui.Px(14);
+                float py = Top0 + slide.Value * Pitch + (ItemH - ph) / 2f;
+                Ui.FillRound(g, Ui.Accent, new RectangleF(Ui.Px(8), py, Ui.Px(3), ph), Ui.Px(1.5f));
+                if (ShowFocus) Ui.FocusRing(g, ItemRect(selected), Ui.Px(4));
+            }
+
+            int y = Height - Ui.Px(66);
+            using (var b = new SolidBrush(Ui.Divider)) g.FillRectangle(b, Ui.Px(16), y - Ui.Px(10), Width - Ui.Px(28), Ui.Hair);
+            StatusLine(g, y, camText, camDot);
+            StatusLine(g, y + Ui.Px(26), lightText, lightDot);
+        }
+
+        void StatusLine(Graphics g, int y, string text, Color dot)
         {
             float r = Ui.Px(4);
-            using (var b = new SolidBrush(dot)) g.FillEllipse(b, Ui.Px(22), y + Ui.Px(10) - r, r * 2, r * 2);
-            Ui.DrawText(g, text, Ui.Small, Ui.Text2, new Rectangle(Ui.Px(40), y, Width - Ui.Px(44), Ui.Px(20)), TextFormatFlags.VerticalCenter);
+            using (var b = new SolidBrush(dot)) g.FillEllipse(b, Ui.Px(30) - r, y + Ui.Px(10) - r, r * 2, r * 2);
+            Ui.DrawText(g, text, Ui.Small, Ui.Text2, new Rectangle(Ui.Px(54), y, Width - Ui.Px(62), Ui.Px(20)), TextFormatFlags.VerticalCenter);
         }
     }
 }
